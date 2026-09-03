@@ -1,0 +1,97 @@
+id: list_flows
+namespace: company.ai
+
+description: |
+  Lists the flows defined in this Kestra instance. Exposed as an MCP tool so
+  Claude can answer questions about what workflows exist.
+
+  The API response is downloaded to a file rather than interpolated into the
+  script body: flow source contains Pebble expressions, and Kestra renders
+  expressions recursively, so injecting it inline makes the renderer try to
+  evaluate the returned flows' own templating.
+
+inputs:
+  - id: query
+    type: STRING
+    required: false
+    description: Optional search term to filter flows by id or namespace.
+
+  - id: size
+    type: INT
+    required: false
+    description: Maximum number of flows to return. Defaults to 100.
+
+tasks:
+  - id: search
+    type: io.kestra.plugin.core.http.Download
+    uri: "http://localhost:8080/api/v1/main/flows/search?q={{ inputs.query | default('') }}&size={{ inputs.size | default(100) }}"
+    method: GET
+    headers:
+      Authorization: "Basic {{ secret('KESTRA_BASIC_AUTH') }}"
+
+  - id: shape
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Reduce each flow to safe metadata. The raw response contains full flow
+      source including any hardcoded credentials — only the allow-listed
+      fields below ever leave this task.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install --quiet kestra
+    inputFiles:
+      flows.json: "{{ outputs.search.uri }}"
+    script: |
+      import json
+      from kestra import Kestra
+
+      with open("flows.json") as fh:
+          body = json.load(fh)
+
+      def summarise(flow):
+          description = (flow.get("description") or "").strip()
+          first_line = description.split("\n")[0][:160] if description else ""
+          return {
+              "id": flow.get("id"),
+              "namespace": flow.get("namespace"),
+              "description": first_line,
+              "disabled": flow.get("disabled", False),
+              "tool": next(
+                  (
+                      t.get("toolName")
+                      for t in flow.get("triggers", []) or []
+                      if t.get("type", "").endswith("McpToolTrigger")
+                  ),
+                  None,
+              ),
+          }
+
+      flows = [summarise(f) for f in body.get("results", [])]
+
+      # Wrapped in an object: Kestra maps a JSON output to an object in the
+      # tool's outputSchema, so a top-level array fails MCP validation.
+      Kestra.outputs({
+          "result": {
+              "total": body.get("total", 0),
+              "returned": len(flows),
+              "flows": flows,
+          }
+      })
+
+outputs:
+  - id: result
+    type: JSON
+    value: "{{ outputs.shape.vars.result }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: list_flows
+    title: List Kestra flows
+    toolDescription: >-
+      Returns the workflows defined in this Kestra instance, with their ids,
+      namespaces and descriptions. Always use this tool when asked what flows,
+      workflows or pipelines exist, or to look one up by name — this
+      information lives only in Kestra and cannot be answered from memory.
+    mcpServer: default
